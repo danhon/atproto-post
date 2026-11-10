@@ -182,3 +182,54 @@ def test_context_manager_closes_the_http_client():
     with BlueskyClient("https://bsky.social", "u", "p", langs=["en"], client=http):
         assert not http.is_closed
     assert http.is_closed
+
+
+# --- set_avatar (from bigpipebot's tests/test_avatar.py) ----------------------
+
+BLOB = {"$type": "blob", "ref": {"$link": "bafk"}, "mimeType": "image/png", "size": 9}
+
+
+def _profile_handler(get_response):
+    seen = {}
+
+    def handler(request):
+        method = request.url.path.rsplit("/", 1)[-1]
+        if method.endswith("createSession"):
+            return httpx.Response(200, json=SESSION)
+        if method.endswith("uploadBlob"):
+            seen["upload_type"] = request.headers["content-type"]
+            return httpx.Response(200, json={"blob": BLOB})
+        if method.endswith("getRecord"):
+            return get_response
+        if method.endswith("putRecord"):
+            seen["put"] = json.loads(request.content)
+            return httpx.Response(200, json={"uri": "at://x", "cid": "c2"})
+        raise AssertionError(method)
+
+    return handler, seen
+
+
+def test_set_avatar_keeps_the_rest_of_the_profile():
+    existing = {"$type": "app.bsky.actor.profile", "displayName": "Big Pipe",
+                "description": "bio", "avatar": {"old": True}}
+    handler, seen = _profile_handler(httpx.Response(200, json={"value": existing, "cid": "c1"}))
+    _client(handler).set_avatar(b"png")
+    put = seen["put"]
+    assert seen["upload_type"] == "image/png"
+    assert put["rkey"] == "self" and put["swapRecord"] == "c1"
+    assert put["record"]["displayName"] == "Big Pipe"
+    assert put["record"]["description"] == "bio"
+    assert put["record"]["avatar"] == BLOB
+
+
+def test_set_avatar_creates_a_missing_profile():
+    handler, seen = _profile_handler(httpx.Response(400, json={"error": "RecordNotFound"}))
+    _client(handler).set_avatar(b"png")
+    assert "swapRecord" not in seen["put"]
+    assert seen["put"]["record"]["avatar"] == BLOB
+
+
+def test_set_avatar_refusal_raises():
+    handler, _ = _profile_handler(httpx.Response(500))
+    with pytest.raises(BlueskyError):
+        _client(handler).set_avatar(b"png")
