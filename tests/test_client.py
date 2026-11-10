@@ -233,3 +233,84 @@ def test_set_avatar_refusal_raises():
     handler, _ = _profile_handler(httpx.Response(500))
     with pytest.raises(BlueskyError):
         _client(handler).set_avatar(b"png")
+
+
+# --- upload_blob and embeds (v0.2.0, for BlueBirdNET) -------------------------
+
+
+def _blob_handler(responses):
+    seen = []
+    responses = iter(responses)
+
+    def handler(request):
+        if request.url.path.endswith("createSession"):
+            return httpx.Response(200, json=SESSION)
+        assert request.url.path.endswith("uploadBlob")
+        seen.append((request.headers["content-type"], request.content,
+                     request.headers["authorization"]))
+        return next(responses)
+
+    return handler, seen
+
+
+def test_upload_blob_returns_the_blob():
+    handler, seen = _blob_handler([httpx.Response(200, json={"blob": BLOB})])
+    assert _client(handler).upload_blob(b"jpegbytes", "image/jpeg; charset=binary") == BLOB
+    assert seen == [("image/jpeg", b"jpegbytes", "Bearer jwt-1")]
+
+
+def test_upload_blob_retries_429_and_5xx():
+    """A blob is content-addressed and unreferenced until a record uses it, so
+    uploading it twice is harmless: unlike createRecord, 5xx is retried."""
+    handler, seen = _blob_handler([httpx.Response(429), httpx.Response(502),
+                                   httpx.Response(200, json={"blob": BLOB})])
+    assert _client(handler).upload_blob(b"x", "image/png") == BLOB
+    assert len(seen) == 3
+
+
+def test_upload_blob_relogs_on_expired_token():
+    handler, seen = _blob_handler([httpx.Response(400, json={"error": "ExpiredToken"}),
+                                   httpx.Response(200, json={"blob": BLOB})])
+    assert _client(handler).upload_blob(b"x", "image/png") == BLOB
+    assert len(seen) == 2
+
+
+def test_upload_blob_refusal_and_transport_error_raise_blueskyerror():
+    handler, _ = _blob_handler([httpx.Response(413, json={"error": "BlobTooLarge"})])
+    with pytest.raises(BlueskyError):
+        _client(handler).upload_blob(b"x", "image/png")
+
+    def boom(request):
+        if request.url.path.endswith("createSession"):
+            return httpx.Response(200, json=SESSION)
+        raise httpx.ConnectError("down")
+
+    with pytest.raises(BlueskyError):
+        _client(boom).upload_blob(b"x", "image/png")
+
+
+def test_post_with_embed():
+    seen = {}
+
+    def handler(request):
+        if request.url.path.endswith("createSession"):
+            return httpx.Response(200, json=SESSION)
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json=CREATED)
+
+    embed = {"$type": "app.bsky.embed.images", "images": [{"alt": "a bird", "image": BLOB}]}
+    _client(handler).post("Anna's Hummingbird", embed=embed)
+    assert seen["record"]["embed"] == embed
+
+
+def test_post_without_embed_has_no_embed_key():
+    seen = {}
+
+    def handler(request):
+        if request.url.path.endswith("createSession"):
+            return httpx.Response(200, json=SESSION)
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json=CREATED)
+
+    _client(handler).post("hi")
+    assert "embed" not in seen["record"]

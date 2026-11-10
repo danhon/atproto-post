@@ -1,7 +1,7 @@
 # atproto-post
 
-A minimal, synchronous Bluesky PDS client for posting bots: log in, post,
-set the profile picture. About 250 lines of XRPC over `httpx`, no SDK.
+A minimal, synchronous Bluesky PDS client for posting bots: log in, post
+(with facets and image embeds), upload a blob, set the profile picture. About 250 lines of XRPC over `httpx`, no SDK.
 
 It was extracted in 2026-11 from two bots that each had their own copy,
 [Profane Town Crier](https://github.com/danhon/profane-town-crier) and
@@ -20,18 +20,23 @@ with BlueskyClient("https://bsky.social", "bot.bsky.social", app_password,
         ...  # may have been posted: record it as done-or-unknown, never retry
     except BlueskyError:
         ...  # refused, nothing written: safe to try again next tick
+
+    # An image post: upload first, then reference the blob in the embed.
+    blob = client.upload_blob(jpeg_bytes, "image/jpeg")
+    client.post("A bird", embed={"$type": "app.bsky.embed.images",
+                                 "images": [{"alt": "A bird", "image": blob}]})
 ```
 
 ## What it does with failures
 
-| Response | `login` (createSession) | `post` (createRecord) |
-|---|---|---|
-| `429` | Retried, honouring `Retry-After` | Retried, honouring `Retry-After` |
-| `5xx` | Retried | `AmbiguousWriteError`, not retried |
-| Transport error (timeout, reset) | Raised as `httpx.TransportError` | `AmbiguousWriteError` |
-| `2xx` with no readable `uri` | — | `AmbiguousWriteError` |
-| `400 ExpiredToken`/`InvalidToken`, or `401` | — | One re-login, one retry |
-| Other `4xx` | `BlueskyError` | `BlueskyError` |
+| Response | `login` (createSession) | `post` (createRecord) | `upload_blob` |
+|---|---|---|---|
+| `429` | Retried, honouring `Retry-After` | Retried, honouring `Retry-After` | Retried |
+| `5xx` | Retried | `AmbiguousWriteError`, not retried | Retried (a blob is harmless to upload twice) |
+| Transport error (timeout, reset) | Raised as `httpx.TransportError` | `AmbiguousWriteError` | `BlueskyError` |
+| `2xx` with no readable `uri` | — | `AmbiguousWriteError` | — |
+| `400 ExpiredToken`/`InvalidToken`, or `401` | — | One re-login, one retry | One re-login, one retry |
+| Other `4xx` | `BlueskyError` | `BlueskyError` | `BlueskyError` |
 
 **An ambiguous write is the caller's problem, deliberately.** The PDS may have
 committed the record and then failed to say so. Retrying would risk a
@@ -50,6 +55,11 @@ read and the write is not overwritten.
 Async, rate limiting of AppView reads, scheduling, deduplication, templating,
 and dry-run all live in the apps. That's where the bots differ.
 
+## Versions
+
+- `v0.2.0` (2026-11-10): `upload_blob`, and `post(..., embed=...)`. Additive. For BlueBirdNET.
+- `v0.1.0` (2026-11-10): extracted from bigpipebot and Profane Town Crier.
+
 ## Using it from an app
 
 Pin a tag's tarball. The fleet's Docker build images have no `git`, so a
@@ -57,7 +67,7 @@ git dependency would fail inside `docker compose build`:
 
 ```toml
 dependencies = [
-    "atproto-post @ https://github.com/danhon/atproto-post/archive/refs/tags/v0.1.0.tar.gz",
+    "atproto-post @ https://github.com/danhon/atproto-post/archive/refs/tags/v0.2.0.tar.gz",
 ]
 ```
 

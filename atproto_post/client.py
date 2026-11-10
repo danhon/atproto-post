@@ -1,5 +1,5 @@
-"""A minimal Bluesky PDS client: createSession, createRecord and the
-profile picture, no SDK.
+"""A minimal Bluesky PDS client: createSession, createRecord, uploadBlob and
+the profile picture, no SDK.
 
 Follows the fleet's atproto conventions (reverse-proxy
 docs-site/docs/services/bluesky-clients.md):
@@ -64,12 +64,17 @@ class BlueskyClient:
     def _url(self, method: str) -> str:
         return f"{self.pds}/xrpc/{method}"
 
-    def _post_with_backoff(self, url: str, payload: dict, headers: dict | None = None, *,
-                           retry_server_errors: bool) -> httpx.Response:
+    def _post_with_backoff(self, url: str, payload: dict | None, headers: dict | None = None, *,
+                           retry_server_errors: bool, content: bytes | None = None
+                           ) -> httpx.Response:
+        """POST `payload` as JSON, or raw `content` when given."""
         delay = 1.0
         response: httpx.Response | None = None
         for attempt in range(self.max_retries):
-            response = self._client.post(url, json=payload, headers=headers or {})
+            if content is not None:
+                response = self._client.post(url, content=content, headers=headers or {})
+            else:
+                response = self._client.post(url, json=payload, headers=headers or {})
             code = response.status_code
             retryable = code == 429 or (code >= 500 and retry_server_errors)
             if not retryable or attempt == self.max_retries - 1:
@@ -127,8 +132,10 @@ class BlueskyClient:
             raise AmbiguousWriteError(f"createRecord transport error: {exc}") from exc
 
     def post(self, text: str, facets: list[dict] | None = None, *,
-             created_at: dt.datetime | None = None) -> PostResult:
-        """`created_at` backdates the record (backfill only); default now."""
+             created_at: dt.datetime | None = None, embed: dict | None = None) -> PostResult:
+        """`created_at` backdates the record (backfill only); default now.
+        `embed` is passed through as the record's embed, e.g. an
+        `app.bsky.embed.images` holding blobs from `upload_blob`."""
         if self._access_jwt is None:
             self.login()
         when = (created_at or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
@@ -140,6 +147,8 @@ class BlueskyClient:
         }
         if facets:
             record["facets"] = facets
+        if embed is not None:
+            record["embed"] = embed
         payload = {"repo": self.did, "collection": POST_COLLECTION, "record": record}
 
         response = self._create(payload)
@@ -160,6 +169,40 @@ class BlueskyClient:
         except (ValueError, KeyError, TypeError) as exc:
             raise AmbiguousWriteError(f"createRecord {code} without a uri: {response.text[:300]}") from exc
         return PostResult(uri=uri, cid=data.get("cid"))
+
+    # --- blobs ----------------------------------------------------------------
+
+    def upload_blob(self, content: bytes, content_type: str) -> dict:
+        """Upload `content` and return the blob reference to put in a record.
+
+        Unlike createRecord, this retries `5xx` too: a blob is content-addressed
+        and stays unreferenced (and is eventually discarded) until a record
+        points at it, so uploading it twice is harmless. Any failure raises
+        `BlueskyError`, never `AmbiguousWriteError`."""
+        mime = content_type.split(";", 1)[0].strip() or "application/octet-stream"
+        if self._access_jwt is None:
+            self.login()
+
+        def send() -> httpx.Response:
+            return self._post_with_backoff(
+                self._url("com.atproto.repo.uploadBlob"), None,
+                {"Authorization": f"Bearer {self._access_jwt}", "Content-Type": mime},
+                retry_server_errors=True, content=content)
+
+        try:
+            response = send()
+            if self._is_expired(response):
+                log.info("session expired; logging in again")
+                self.login()
+                response = send()
+        except httpx.TransportError as exc:
+            raise BlueskyError(f"uploadBlob transport error: {exc}") from exc
+        if response.status_code >= 400:
+            raise BlueskyError(f"uploadBlob HTTP {response.status_code}: {response.text[:300]}")
+        try:
+            return response.json()["blob"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise BlueskyError(f"uploadBlob without a blob: {response.text[:300]}") from exc
 
     # --- profile picture -----------------------------------------------------
     #
@@ -183,12 +226,7 @@ class BlueskyClient:
     def set_avatar(self, png: bytes) -> None:
         """Upload `png` and make it the profile picture, keeping every other
         field of the profile record (name, bio, banner) as it is."""
-        r = self._authed(lambda h: self._client.post(
-            self._url("com.atproto.repo.uploadBlob"), content=png,
-            headers={**h, "Content-Type": "image/png"}))
-        if r.status_code >= 400:
-            raise BlueskyError(f"uploadBlob HTTP {r.status_code}: {r.text[:300]}")
-        blob = r.json()["blob"]
+        blob = self.upload_blob(png, "image/png")
 
         r = self._authed(lambda h: self._client.get(
             self._url("com.atproto.repo.getRecord"), headers=h,
