@@ -1,0 +1,24 @@
+[project]
+name = "atproto-post"
+version = "0.1.0"
+description = "A minimal sync Bluesky PDS client for posting bots: log in, post, set the avatar"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+include = ["atproto_post/**/*.py"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
