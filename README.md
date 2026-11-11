@@ -50,6 +50,40 @@ harmless, so any failure is safe to retry on the next tick. It keeps the rest
 of the profile record and uses `swapRecord`, so a hand edit made between the
 read and the write is not overwritten.
 
+## Logging
+
+The library logs to the `atproto_post.client` logger and never configures
+logging itself: no handlers, no levels. What it says:
+
+| Level | When |
+|---|---|
+| `INFO` | `logged in as <handle> (<did>)`; `session expired; logging in again` |
+| `WARNING` | `PDS returned <code>; retrying in <n>s (<attempt>/<max>)`, on a `429` (any call) or a `5xx` (`login`, `upload_blob`) |
+
+**It doesn't log post outcomes.** Posted, refused and ambiguous all come back
+to the caller, as a `PostResult` or an exception. The app logs them, because
+only the app knows which slot, detection or ledger row the post was for. If
+the library logged them too, every outcome would appear twice.
+
+**Quiet httpx in the app.** httpx logs every request at `INFO`
+(`HTTP Request: POST https://bsky.social/xrpc/... "HTTP/1.1 200 OK"`), so an
+app logging at `INFO` gets one extra line per call. A post with an image is
+two calls. The library leaves this alone, because it would mean changing
+another package's logging behind the app's back. Add this where the app sets
+up logging:
+
+```python
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+```
+
+Leave them at `INFO` while debugging a call.
+
+**Count degradations; don't just log them.** If a bot carries on without
+something (a picture, a facet), log it, and also count it in whatever
+health line the bot writes. One bot here logged a warning on every post for
+two months while its pictures were missing, and nobody saw it.
+
 ## Not in scope
 
 Async, rate limiting of AppView reads, scheduling, deduplication, templating,
