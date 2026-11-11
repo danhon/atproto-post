@@ -314,3 +314,89 @@ def test_post_without_embed_has_no_embed_key():
 
     _client(handler).post("hi")
     assert "embed" not in seen["record"]
+
+
+# --- login failures never escape as anything but BlueskyError ----------------
+# (v0.2.1) Nothing is written by createSession, so every login failure is a
+# definite one: the caller's "refused, try again next tick" branch.
+
+def _login_fails_with(exc_or_response):
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path.rsplit(".", 1)[-1])
+        if request.url.path.endswith("createSession"):
+            if isinstance(exc_or_response, Exception):
+                raise exc_or_response
+            return exc_or_response
+        return httpx.Response(200, json=CREATED)
+
+    return handler, calls
+
+
+def test_login_transport_error_is_a_blueskyerror_not_ambiguous():
+    handler, _ = _login_fails_with(httpx.ConnectError("dns"))
+    with pytest.raises(BlueskyError) as info:
+        _client(handler).login()
+    assert not isinstance(info.value, AmbiguousWriteError)
+
+
+def test_post_whose_login_has_a_transport_error_wrote_nothing():
+    handler, calls = _login_fails_with(httpx.ReadTimeout("slow"))
+    with pytest.raises(BlueskyError) as info:
+        _client(handler).post("hi")
+    assert not isinstance(info.value, AmbiguousWriteError)
+    assert "createRecord" not in calls
+
+
+def test_relogin_after_expiry_with_a_transport_error_is_a_blueskyerror():
+    state = {"logins": 0}
+
+    def handler(request):
+        if request.url.path.endswith("createSession"):
+            state["logins"] += 1
+            if state["logins"] > 1:
+                raise httpx.ConnectError("dns")
+            return httpx.Response(200, json=SESSION)
+        return httpx.Response(400, json={"error": "ExpiredToken"})
+
+    with pytest.raises(BlueskyError) as info:
+        _client(handler).post("hi")
+    assert not isinstance(info.value, AmbiguousWriteError)
+
+
+@pytest.mark.parametrize("response", [
+    httpx.Response(200, json={"did": "did:plc:abc"}),    # no accessJwt
+    httpx.Response(200, content=b"<html>proxy</html>"),  # not JSON
+    httpx.Response(200, json=["a", "list"]),             # not an object
+])
+def test_malformed_login_reply_is_a_blueskyerror(response):
+    handler, _ = _login_fails_with(response)
+    with pytest.raises(BlueskyError):
+        _client(handler).login()
+
+
+def test_retry_after_wait_is_capped(monkeypatch):
+    slept = []
+    monkeypatch.setattr(client_module.time, "sleep", slept.append)
+    handler, _ = _router([httpx.Response(429, headers={"retry-after": "86400"}),
+                          httpx.Response(200, json=CREATED)])
+    _client(handler).post("hi")
+    assert slept and max(slept) <= client_module.MAX_RETRY_WAIT_SECONDS
+
+
+def test_expired_check_survives_a_non_object_body():
+    def handler(request):
+        if request.url.path.endswith("createSession"):
+            return httpx.Response(200, json=SESSION)
+        return httpx.Response(400, json=["odd"])
+
+    with pytest.raises(BlueskyError):
+        _client(handler).post("hi")
+
+
+def test_set_avatar_with_an_unreadable_profile_is_a_blueskyerror():
+    handler, seen = _profile_handler(httpx.Response(200, content=b"<html>"))
+    with pytest.raises(BlueskyError):
+        _client(handler).set_avatar(b"png")
+    assert "put" not in seen

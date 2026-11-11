@@ -31,9 +31,10 @@ with BlueskyClient("https://bsky.social", "bot.bsky.social", app_password,
 
 | Response | `login` (createSession) | `post` (createRecord) | `upload_blob` |
 |---|---|---|---|
-| `429` | Retried, honouring `Retry-After` | Retried, honouring `Retry-After` | Retried |
+| `429` | Retried, honouring `Retry-After` (capped at 5 min) | Retried, honouring `Retry-After` (capped at 5 min) | Retried |
 | `5xx` | Retried | `AmbiguousWriteError`, not retried | Retried (a blob is harmless to upload twice) |
-| Transport error (timeout, reset) | Raised as `httpx.TransportError` | `AmbiguousWriteError` | `BlueskyError` |
+| Transport error (timeout, reset) | `BlueskyError` (nothing was written) | `AmbiguousWriteError` | `BlueskyError` |
+| `2xx` with no readable session | `BlueskyError` | — | — |
 | `2xx` with no readable `uri` | — | `AmbiguousWriteError` | — |
 | `400 ExpiredToken`/`InvalidToken`, or `401` | — | One re-login, one retry | One re-login, one retry |
 | Other `4xx` | `BlueskyError` | `BlueskyError` | `BlueskyError` |
@@ -44,6 +45,14 @@ duplicate on a public timeline, which can't be undone. Missing one post can be
 recovered from. So the library never retries it, and the app has to record
 that slot or row as attempted. `AmbiguousWriteError` subclasses
 `BlueskyError`. If you catch it, catch it first.
+
+**Nothing else escapes.** Every failure of `login`, `post`, `upload_blob` and
+`set_avatar` is a `BlueskyError` or its subclass, so `except BlueskyError` is a
+complete handler. This matters inside `post`, which logs in again by itself
+when the session expires (about every two hours): a network blip during that
+login is a refusal, not an ambiguous write. Before v0.2.1 it escaped as a raw
+`httpx.TransportError`, which bigpipebot's ledger recorded as `unknown` and so
+never posted.
 
 `set_avatar` is state, not an event: setting the same picture twice is
 harmless, so any failure is safe to retry on the next tick. It keeps the rest
@@ -91,6 +100,9 @@ and dry-run all live in the apps. That's where the bots differ.
 
 ## Versions
 
+- `v0.2.1` (2026-11-11): every login failure (transport error, malformed reply) is a
+  `BlueskyError`, including the re-login inside `post`; `Retry-After` capped at
+  5 minutes; an unreadable profile in `set_avatar` is a `BlueskyError`. Fixes only.
 - `v0.2.0` (2026-11-10): `upload_blob`, and `post(..., embed=...)`. Additive. For BlueBirdNET.
 - `v0.1.0` (2026-11-10): extracted from bigpipebot and Profane Town Crier.
 
@@ -101,7 +113,7 @@ git dependency would fail inside `docker compose build`:
 
 ```toml
 dependencies = [
-    "atproto-post @ https://github.com/danhon/atproto-post/archive/refs/tags/v0.2.0.tar.gz",
+    "atproto-post @ https://github.com/danhon/atproto-post/archive/refs/tags/v0.2.1.tar.gz",
 ]
 ```
 

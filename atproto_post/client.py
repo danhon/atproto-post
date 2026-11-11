@@ -30,6 +30,10 @@ log = logging.getLogger(__name__)
 POST_COLLECTION = "app.bsky.feed.post"
 PROFILE_COLLECTION = "app.bsky.actor.profile"
 
+# A `Retry-After` is honoured up to this long. A bot blocked for an hour on
+# one call is worse than giving up and letting the next tick try again.
+MAX_RETRY_WAIT_SECONDS = 300.0
+
 
 class BlueskyError(RuntimeError):
     """A PDS call was refused. Nothing was written."""
@@ -83,7 +87,7 @@ class BlueskyClient:
             retry_after = response.headers.get("retry-after")
             if retry_after:
                 try:
-                    wait = max(wait, float(retry_after))
+                    wait = min(max(wait, float(retry_after)), MAX_RETRY_WAIT_SECONDS)
                 except ValueError:
                     pass
             log.warning("PDS returned %s; retrying in %.1fs (%d/%d)", code, wait,
@@ -100,23 +104,36 @@ class BlueskyClient:
         if response.status_code != 400:
             return False
         try:
-            return response.json().get("error") in {"ExpiredToken", "InvalidToken"}
+            body = response.json()
         except ValueError:
             return False
+        return isinstance(body, dict) and body.get("error") in {"ExpiredToken", "InvalidToken"}
 
     def login(self) -> None:
-        response = self._post_with_backoff(
-            self._url("com.atproto.server.createSession"),
-            {"identifier": self.username, "password": self.app_password},
-            retry_server_errors=True,
-        )
+        """Start a session. Every failure raises `BlueskyError`, never
+        `AmbiguousWriteError` or an httpx exception: createSession writes
+        nothing, so it is always safe to try again (from v0.2.1)."""
+        try:
+            response = self._post_with_backoff(
+                self._url("com.atproto.server.createSession"),
+                {"identifier": self.username, "password": self.app_password},
+                retry_server_errors=True,
+            )
+        except httpx.TransportError as exc:
+            raise BlueskyError(f"createSession transport error: {exc}") from exc
         if response.status_code >= 400:
             raise BlueskyError(
                 f"createSession failed: HTTP {response.status_code} {response.text[:300]}"
             )
-        data = response.json()
-        self._access_jwt = data["accessJwt"]
-        self.did = data["did"]
+        try:
+            data = response.json()
+            access_jwt, did = data["accessJwt"], data["did"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise BlueskyError(
+                f"createSession {response.status_code} without a session: {response.text[:300]}"
+            ) from exc
+        self._access_jwt = access_jwt
+        self.did = did
         self.handle = data.get("handle", self.username)
         log.info("logged in as %s (%s)", self.handle, self.did)
 
@@ -236,8 +253,11 @@ class BlueskyClient:
         elif r.status_code >= 400:
             raise BlueskyError(f"getRecord profile HTTP {r.status_code}: {r.text[:300]}")
         else:
-            data = r.json()
-            record, swap = data["value"], data.get("cid")
+            try:
+                data = r.json()
+                record, swap = dict(data["value"]), data.get("cid")
+            except (ValueError, KeyError, TypeError) as exc:
+                raise BlueskyError(f"getRecord profile unreadable: {r.text[:300]}") from exc
 
         record["avatar"] = blob
         payload = {"repo": self.did, "collection": PROFILE_COLLECTION, "rkey": "self",
