@@ -4,8 +4,10 @@ the profile picture, no SDK.
 Follows the fleet's atproto conventions (reverse-proxy
 docs-site/docs/services/bluesky-clients.md):
 
-- `429` is retried, honouring Retry-After. `5xx` is retried only on
-  createSession; on createRecord it is **ambiguous** and never repeated.
+- `429` with a Retry-After is retried, honouring it. A `429` without one is
+  retried once and then raised as `RateLimitedError`: a cap that gives no wait
+  usually lifts in hours, not seconds. `5xx` is retried only on createSession
+  and uploadBlob; on createRecord it is **ambiguous** and never repeated.
 - A transport error on createRecord, or a `2xx` with no readable `uri`, is
   ambiguous too. All three raise `AmbiguousWriteError`, and the caller leaves
   its ledger row `unknown` so the post is never attempted again.
@@ -18,7 +20,9 @@ async client is deliberately not served by this (see the README).
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
+import hashlib
 import logging
 import time
 from dataclasses import dataclass
@@ -36,11 +40,66 @@ MAX_RETRY_WAIT_SECONDS = 300.0
 
 
 class BlueskyError(RuntimeError):
-    """A PDS call was refused. Nothing was written."""
+    """A PDS call was refused. Nothing was written.
+
+    `status` is the HTTP status, or None for a transport error or an
+    unreadable reply, so callers can test it instead of the message."""
+
+    def __init__(self, message: str, *, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 class AmbiguousWriteError(BlueskyError):
     """A write may or may not have happened. Never retry it."""
+
+
+class RateLimitedError(BlueskyError):
+    """The PDS answered 429 and the retries ran out. Nothing was written.
+
+    `retry_after` is the server's Retry-After in seconds, or None when it gave
+    none. None is the common case for a per-endpoint or daily cap, and it means
+    "not soon": back off for a long while (BlueBirdNET pauses uploads for an
+    hour), don't retry on the next tick. RateLimit-* headers are not used: on
+    bsky.social's uploadBlob 429 they described the general per-IP budget,
+    not the limit that was hit."""
+
+    def __init__(self, message: str, *, retry_after: float | None = None,
+                 status: int | None = 429):
+        super().__init__(message, status=status)
+        self.retry_after = retry_after
+
+
+def _retry_after(response: httpx.Response) -> float | None:
+    value = response.headers.get("retry-after")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return None
+
+
+def _raise_for(response: httpx.Response, what: str, *, ambiguous_5xx: bool = False) -> None:
+    """Raise the right error for a 4xx/5xx `response`; return on success."""
+    code = response.status_code
+    if code < 400:
+        return
+    detail = f"{what} HTTP {code}: {response.text[:300]}"
+    if code == 429:
+        raise RateLimitedError(detail, retry_after=_retry_after(response))
+    if code >= 500 and ambiguous_5xx:
+        raise AmbiguousWriteError(detail, status=code)
+    raise BlueskyError(detail, status=code)
+
+
+def blob_cid(content: bytes) -> str:
+    """The CID a PDS gives `content` as a blob: CIDv1, raw codec, sha256,
+    base32. Use it to recognise a blob already uploaded, and reuse its ref
+    instead of uploading again (see `upload_blob`)."""
+    digest = hashlib.sha256(content).digest()
+    raw = bytes([0x01, 0x55, 0x12, 0x20]) + digest
+    return "b" + base64.b32encode(raw).decode("ascii").lower().rstrip("=")
 
 
 @dataclass
@@ -71,8 +130,13 @@ class BlueskyClient:
     def _post_with_backoff(self, url: str, payload: dict | None, headers: dict | None = None, *,
                            retry_server_errors: bool, content: bytes | None = None
                            ) -> httpx.Response:
-        """POST `payload` as JSON, or raw `content` when given."""
+        """POST `payload` as JSON, or raw `content` when given.
+
+        A 429 with Retry-After is retried, waiting that long (capped). A bare
+        429 is retried once, after a second, in case it was a burst limit;
+        a second bare 429 is returned for the caller to raise."""
         delay = 1.0
+        bare_429_retried = False
         response: httpx.Response | None = None
         for attempt in range(self.max_retries):
             if content is not None:
@@ -84,12 +148,15 @@ class BlueskyClient:
             if not retryable or attempt == self.max_retries - 1:
                 return response
             wait = delay
-            retry_after = response.headers.get("retry-after")
-            if retry_after:
-                try:
-                    wait = min(max(wait, float(retry_after)), MAX_RETRY_WAIT_SECONDS)
-                except ValueError:
-                    pass
+            if code == 429:
+                retry_after = _retry_after(response)
+                if retry_after is not None:
+                    wait = min(max(wait, retry_after), MAX_RETRY_WAIT_SECONDS)
+                elif bare_429_retried:
+                    return response
+                else:
+                    bare_429_retried = True
+                    wait = 1.0
             log.warning("PDS returned %s; retrying in %.1fs (%d/%d)", code, wait,
                         attempt + 1, self.max_retries)
             time.sleep(wait)
@@ -121,16 +188,14 @@ class BlueskyClient:
             )
         except httpx.TransportError as exc:
             raise BlueskyError(f"createSession transport error: {exc}") from exc
-        if response.status_code >= 400:
-            raise BlueskyError(
-                f"createSession failed: HTTP {response.status_code} {response.text[:300]}"
-            )
+        _raise_for(response, "createSession")
         try:
             data = response.json()
             access_jwt, did = data["accessJwt"], data["did"]
         except (ValueError, KeyError, TypeError) as exc:
             raise BlueskyError(
-                f"createSession {response.status_code} without a session: {response.text[:300]}"
+                f"createSession {response.status_code} without a session: {response.text[:300]}",
+                status=response.status_code,
             ) from exc
         self._access_jwt = access_jwt
         self.did = did
@@ -176,15 +241,13 @@ class BlueskyClient:
             response = self._create(payload)
 
         code = response.status_code
-        if code >= 500:
-            raise AmbiguousWriteError(f"createRecord HTTP {code}: {response.text[:300]}")
-        if code >= 400:
-            raise BlueskyError(f"createRecord HTTP {code}: {response.text[:300]}")
+        _raise_for(response, "createRecord", ambiguous_5xx=True)
         try:
             data = response.json()
             uri = data["uri"]
         except (ValueError, KeyError, TypeError) as exc:
-            raise AmbiguousWriteError(f"createRecord {code} without a uri: {response.text[:300]}") from exc
+            raise AmbiguousWriteError(f"createRecord {code} without a uri: {response.text[:300]}",
+                                      status=code) from exc
         return PostResult(uri=uri, cid=data.get("cid"))
 
     # --- blobs ----------------------------------------------------------------
@@ -195,7 +258,13 @@ class BlueskyClient:
         Unlike createRecord, this retries `5xx` too: a blob is content-addressed
         and stays unreferenced (and is eventually discarded) until a record
         points at it, so uploading it twice is harmless. Any failure raises
-        `BlueskyError`, never `AmbiguousWriteError`."""
+        `BlueskyError` (`RateLimitedError` on a 429), never `AmbiguousWriteError`.
+
+        Harmless, but not free: bsky.social caps uploads separately from posts.
+        A bot that posts the same picture again should keep the ref this
+        returns, keyed by `blob_cid(content)`, and put it in the new record
+        instead of uploading again. A record may reference a blob that another
+        record already uses."""
         mime = content_type.split(";", 1)[0].strip() or "application/octet-stream"
         if self._access_jwt is None:
             self.login()
@@ -214,12 +283,12 @@ class BlueskyClient:
                 response = send()
         except httpx.TransportError as exc:
             raise BlueskyError(f"uploadBlob transport error: {exc}") from exc
-        if response.status_code >= 400:
-            raise BlueskyError(f"uploadBlob HTTP {response.status_code}: {response.text[:300]}")
+        _raise_for(response, "uploadBlob")
         try:
             return response.json()["blob"]
         except (ValueError, KeyError, TypeError) as exc:
-            raise BlueskyError(f"uploadBlob without a blob: {response.text[:300]}") from exc
+            raise BlueskyError(f"uploadBlob without a blob: {response.text[:300]}",
+                               status=response.status_code) from exc
 
     # --- profile picture -----------------------------------------------------
     #
@@ -251,7 +320,7 @@ class BlueskyClient:
         if r.status_code == 400 and "RecordNotFound" in r.text:
             record, swap = {"$type": PROFILE_COLLECTION}, None
         elif r.status_code >= 400:
-            raise BlueskyError(f"getRecord profile HTTP {r.status_code}: {r.text[:300]}")
+            _raise_for(r, "getRecord profile")
         else:
             try:
                 data = r.json()
@@ -268,8 +337,7 @@ class BlueskyClient:
             payload["swapRecord"] = swap
         r = self._authed(lambda h: self._client.post(
             self._url("com.atproto.repo.putRecord"), json=payload, headers=h))
-        if r.status_code >= 400:
-            raise BlueskyError(f"putRecord profile HTTP {r.status_code}: {r.text[:300]}")
+        _raise_for(r, "putRecord profile")
 
     def close(self) -> None:
         self._client.close()

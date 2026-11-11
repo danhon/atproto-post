@@ -7,7 +7,7 @@ import json
 import httpx
 import pytest
 
-from atproto_post import AmbiguousWriteError, BlueskyClient, BlueskyError
+from atproto_post import AmbiguousWriteError, BlueskyClient, BlueskyError, RateLimitedError, blob_cid
 from atproto_post import client as client_module
 
 SESSION = {"accessJwt": "jwt-1", "refreshJwt": "r", "did": "did:plc:abc", "handle": "pipe.test"}
@@ -121,10 +121,9 @@ def test_login_5xx_is_retried():
 
 def test_a_write_is_still_retried_on_429():
     """429 means the request was rejected outright, so nothing was written."""
-    handler, calls = _router([httpx.Response(429), httpx.Response(429),
-                              httpx.Response(200, json=CREATED)])
+    handler, calls = _router([httpx.Response(429), httpx.Response(200, json=CREATED)])
     assert _client(handler, max_retries=4).post("hello").cid == "cid1"
-    assert calls.count("createRecord") == 3
+    assert calls.count("createRecord") == 2
 
 
 def test_bad_credentials_are_not_retried():
@@ -400,3 +399,104 @@ def test_set_avatar_with_an_unreadable_profile_is_a_blueskyerror():
     with pytest.raises(BlueskyError):
         _client(handler).set_avatar(b"png")
     assert "put" not in seen
+
+
+# --- 429s: a bare one is retried once, then raised as RateLimitedError -------
+# (v0.3.0) bsky.social's uploadBlob cap answered 429 with no Retry-After, and
+# RateLimit-* headers describing a different (general) budget. Seconds-scale
+# backoff into a cap that lifts in hours only kept the bot pressed against it.
+
+def test_a_bare_429_is_retried_once_then_raised():
+    handler, calls = _router([httpx.Response(429), httpx.Response(429),
+                              httpx.Response(200, json=CREATED)])
+    with pytest.raises(RateLimitedError) as info:
+        _client(handler, max_retries=4).post("hi")
+    err = info.value
+    assert isinstance(err, BlueskyError) and not isinstance(err, AmbiguousWriteError)
+    assert err.status == 429 and err.retry_after is None
+    assert calls.count("createRecord") == 2
+
+
+def test_a_bare_429_ignores_ratelimit_reset(monkeypatch):
+    """On the live 429, RateLimit-Reset described the general budget, not the
+    limit that was hit; waiting for it would be a guess presented as a fact."""
+    slept = []
+    monkeypatch.setattr(client_module.time, "sleep", slept.append)
+    reset = {"ratelimit-reset": "9999999999", "ratelimit-remaining": "2999",
+             "ratelimit-policy": "3000;w=300"}
+    handler, _ = _router([httpx.Response(429, headers=reset), httpx.Response(429, headers=reset)])
+    with pytest.raises(RateLimitedError):
+        _client(handler).post("hi")
+    assert slept == [1.0]
+
+
+def test_a_429_with_retry_after_is_honoured_until_retries_run_out():
+    handler, calls = _router([httpx.Response(429, headers={"retry-after": "2"})] * 4)
+    with pytest.raises(RateLimitedError) as info:
+        _client(handler, max_retries=4).post("hi")
+    assert info.value.retry_after == 2.0
+    assert calls.count("createRecord") == 4
+
+
+def test_upload_blob_bare_429_is_rate_limited():
+    handler, seen = _blob_handler([httpx.Response(429, json={"error": "RateLimitExceeded"})] * 3)
+    with pytest.raises(RateLimitedError) as info:
+        _client(handler).upload_blob(b"x", "image/png")
+    assert info.value.status == 429
+    assert len(seen) == 2
+
+
+def test_login_bare_429_is_rate_limited():
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(429)
+
+    with pytest.raises(RateLimitedError):
+        _client(handler).login()
+    assert len(calls) == 2
+
+
+def test_set_avatar_429_is_rate_limited():
+    handler, _ = _profile_handler(httpx.Response(429))
+    with pytest.raises(RateLimitedError):
+        _client(handler).set_avatar(b"png")
+
+
+# --- the status code is on the exception, not only in its message -----------
+
+def test_status_is_exposed_on_errors():
+    handler, _ = _router([httpx.Response(400, json={"error": "InvalidRequest"})])
+    with pytest.raises(BlueskyError) as info:
+        _client(handler).post("hi")
+    assert info.value.status == 400
+
+    handler, _ = _router([httpx.Response(502)])
+    with pytest.raises(AmbiguousWriteError) as info:
+        _client(handler).post("hi")
+    assert info.value.status == 502
+
+    handler, _ = _router([httpx.ReadTimeout("slow")])
+    with pytest.raises(AmbiguousWriteError) as info:
+        _client(handler).post("hi")
+    assert info.value.status is None
+
+
+def test_errors_still_construct_from_a_message_alone():
+    """Apps' tests raise these with just a message."""
+    assert BlueskyError("x").status is None
+    assert AmbiguousWriteError("x").status is None
+    assert RateLimitedError("x").retry_after is None
+
+
+# --- blob_cid ---------------------------------------------------------------
+
+def test_blob_cid_of_empty_bytes_is_the_known_raw_sha256_cid():
+    assert blob_cid(b"") == "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
+
+
+def test_blob_cid_shape():
+    cid = blob_cid(b"a bird")
+    assert cid.startswith("bafkrei") and cid == cid.lower() and len(cid) == 59
+    assert blob_cid(b"a bird") == cid != blob_cid(b"a bird!")

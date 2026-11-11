@@ -22,6 +22,7 @@ with BlueskyClient("https://bsky.social", "bot.bsky.social", app_password,
         ...  # refused, nothing written: safe to try again next tick
 
     # An image post: upload first, then reference the blob in the embed.
+    # Keep the ref, keyed by blob_cid(jpeg_bytes), and reuse it next time.
     blob = client.upload_blob(jpeg_bytes, "image/jpeg")
     client.post("A bird", embed={"$type": "app.bsky.embed.images",
                                  "images": [{"alt": "A bird", "image": blob}]})
@@ -31,7 +32,8 @@ with BlueskyClient("https://bsky.social", "bot.bsky.social", app_password,
 
 | Response | `login` (createSession) | `post` (createRecord) | `upload_blob` |
 |---|---|---|---|
-| `429` | Retried, honouring `Retry-After` (capped at 5 min) | Retried, honouring `Retry-After` (capped at 5 min) | Retried |
+| `429` with `Retry-After` | Retried, waiting that long (capped at 5 min); then `RateLimitedError` | Same | Same |
+| `429` without `Retry-After` | Retried once after 1 s, then `RateLimitedError` (`retry_after=None`) | Same | Same |
 | `5xx` | Retried | `AmbiguousWriteError`, not retried | Retried (a blob is harmless to upload twice) |
 | Transport error (timeout, reset) | `BlueskyError` (nothing was written) | `AmbiguousWriteError` | `BlueskyError` |
 | `2xx` with no readable session | `BlueskyError` | — | — |
@@ -54,6 +56,29 @@ login is a refusal, not an ambiguous write. Before v0.2.1 it escaped as a raw
 `httpx.TransportError`, which bigpipebot's ledger recorded as `unknown` and so
 never posted.
 
+**A 429 without a `Retry-After` is not retried for long.** On 2026-11-11
+bsky.social refused every `uploadBlob` from BlueBirdNET for hours with a bare
+429. Its `RateLimit-*` headers described the general per-IP budget (2999
+of 3000 left), not the limit that was hit, so the library doesn't read them.
+Retrying at 1, 2 and 4 seconds made four calls per post into a cap that
+wasn't going to lift, and kept the bot pressed against it. Now a bare 429 is
+retried once, in case it was a burst, and then raised as `RateLimitedError`
+with `retry_after=None`. That means "not soon": back off for a long while,
+for example skip pictures for an hour, rather than trying again next tick.
+
+**Test the exception, not its message.** Every `BlueskyError` carries
+`.status`, the HTTP status, or `None` for a transport error or an unreadable
+reply. `RateLimitedError` (a `BlueskyError`, never ambiguous) adds
+`.retry_after`, in seconds or `None`.
+
+**Don't upload the same picture twice.** Uploading again is harmless, but
+uploads are capped separately from posts. `blob_cid(content)` gives the CID
+the PDS will assign (CIDv1, raw, sha256, base32): keep the ref that
+`upload_blob` returns under it, and put it straight into the next record. A
+record may reference a blob another record already uses. Checked live on
+2026-11-11: the CIDs of BlueBirdNET's cached pictures match the blobs on its
+posts.
+
 `set_avatar` is state, not an event: setting the same picture twice is
 harmless, so any failure is safe to retry on the next tick. It keeps the rest
 of the profile record and uses `swapRecord`, so a hand edit made between the
@@ -67,7 +92,7 @@ logging itself: no handlers, no levels. What it says:
 | Level | When |
 |---|---|
 | `INFO` | `logged in as <handle> (<did>)`; `session expired; logging in again` |
-| `WARNING` | `PDS returned <code>; retrying in <n>s (<attempt>/<max>)`, on a `429` (any call) or a `5xx` (`login`, `upload_blob`) |
+| `WARNING` | `PDS returned <code>; retrying in <n>s (<attempt>/<max>)`, on a `429` (any call; once only without `Retry-After`) or a `5xx` (`login`, `upload_blob`) |
 
 **It doesn't log post outcomes.** Posted, refused and ambiguous all come back
 to the caller, as a `PostResult` or an exception. The app logs them, because
@@ -100,6 +125,10 @@ and dry-run all live in the apps. That's where the bots differ.
 
 ## Versions
 
+- `v0.3.0` (2026-11-11): `RateLimitedError` (with `retry_after`), `.status` on
+  every `BlueskyError`, and `blob_cid()`. **Behaviour change:** a 429 without
+  `Retry-After` is retried once, not up to `max_retries` times, then raised.
+  Code that catches `BlueskyError` needs no change. For BlueBirdNET.
 - `v0.2.1` (2026-11-11): every login failure (transport error, malformed reply) is a
   `BlueskyError`, including the re-login inside `post`; `Retry-After` capped at
   5 minutes; an unreadable profile in `set_avatar` is a `BlueskyError`. Fixes only.
@@ -113,7 +142,7 @@ git dependency would fail inside `docker compose build`:
 
 ```toml
 dependencies = [
-    "atproto-post @ https://github.com/danhon/atproto-post/archive/refs/tags/v0.2.1.tar.gz",
+    "atproto-post @ https://github.com/danhon/atproto-post/archive/refs/tags/v0.3.0.tar.gz",
 ]
 ```
 
